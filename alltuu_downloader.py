@@ -2,6 +2,7 @@
 """
 alltuu.com (喔图) Album Downloader
 Uses Playwright to intercept API calls and download original quality photos.
+Supports pagination via container scrolling.
 Target: https://m.alltuu.com/album/1461544002/3712671117?menu=live
 """
 
@@ -38,56 +39,89 @@ def download_album():
         )
         page = context.new_page()
 
-        # ── Step 1: Capture fplN API URL ─────────────────────────────────────
-        state = {"fplN_url": None}
+        # ── Step 1: Capture all fplN API URLs (pagination support) ───────────
+        fplN_urls = []
         def handle_route(route, request):
             url = request.url
-            if "/rest/v4c/fplN/" in url and state["fplN_url"] is None:
-                state["fplN_url"] = url
-                print(f"[API] Captured photo list endpoint")
+            if "/rest/v4c/fplN/" in url and url not in fplN_urls:
+                fplN_urls.append(url)
+                print(f"[API] Captured fplN #{len(fplN_urls)}")
             route.continue_()
 
         page.route("**/*", handle_route)
 
         print(f"[1/4] Navigating to album page...")
-        page.goto(ALBUM_URL, wait_until="domcontentloaded", timeout=30000)
+        page.goto(ALBUM_URL, wait_until="networkidle", timeout=30000)
+        print("  DOM ready, scrolling inside container...")
 
-        # Wait for the API call (with gentle scrolling to trigger lazy-load)
-        for i in range(15):
-            time.sleep(1)
-            if state["fplN_url"]:
+        # Scroll inside the container element to trigger lazy loading
+        prev_count = 0
+        stall_count = 0
+        for i in range(200):
+            time.sleep(1.5)
+            page.evaluate("""
+                () => {
+                    const el = document.querySelector('.component-scroll') || document.querySelector('.album-scrollList');
+                    if (el) el.scrollTop = el.scrollHeight;
+                }
+            """)
+            if len(fplN_urls) > prev_count:
+                prev_count = len(fplN_urls)
+                stall_count = 0
+                print(f"  scroll {i+1}: NEW fplN! total={len(fplN_urls)}")
+            else:
+                stall_count += 1
+                if i % 10 == 0:
+                    print(f"  scroll {i+1}: fplN={len(fplN_urls)} (stall={stall_count})")
+            if stall_count >= 30 and len(fplN_urls) > 0:
+                print(f"  Stopped: no new pages after {stall_count} scrolls")
                 break
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
 
-        if not state["fplN_url"]:
+        time.sleep(2)
+        page.unroute("**/*")
+
+        if not fplN_urls:
             print("[ERROR] Failed to capture photo list API URL. Exiting.")
             browser.close()
             return
 
-        # ── Step 2: Fetch photo list via in-page fetch ───────────────────────
-        print(f"[2/4] Fetching photo list...")
-        result = page.evaluate("""
-            async (url) => {
-                const resp = await fetch(url, {headers: {'Accept': 'application/json'}});
-                if (!resp.ok) return {error: resp.status, text: await resp.text()};
-                return await resp.json();
-            }
-        """, state["fplN_url"])
+        # ── Step 2: Fetch all photo lists ────────────────────────────────────
+        print(f"[2/4] Fetching photo lists from {len(fplN_urls)} page(s)...")
+        all_photos = []
+        for api_idx, api_url in enumerate(fplN_urls, 1):
+            result = page.evaluate("""
+                async (url) => {
+                    const resp = await fetch(url, {headers: {'Accept': 'application/json'}});
+                    if (!resp.ok) return {error: resp.status, text: await resp.text()};
+                    return await resp.json();
+                }
+            """, api_url)
 
-        if isinstance(result, dict) and 'error' in result:
-            print(f"[ERROR] API error {result['error']}: {result.get('text', '')[:200]}")
-            browser.close()
-            return
+            if isinstance(result, dict) and 'error' in result:
+                print(f"  [ERROR] Page {api_idx}: API error {result['error']}")
+                continue
 
-        photos = result.get("d", [])
-        total = len(photos)
-        print(f"[2/4] Found {total} photos")
-        if not photos:
+            photos = result.get("d", [])
+            all_photos.extend(photos)
+            print(f"  Page {api_idx}: {len(photos)} photos")
+
+        # Remove duplicates by pc (photo hash)
+        seen = set()
+        unique_photos = []
+        for ph in all_photos:
+            pc = ph.get('pc')
+            if pc and pc not in seen:
+                seen.add(pc)
+                unique_photos.append(ph)
+
+        total = len(unique_photos)
+        print(f"[2/4] Total unique photos: {total}")
+        if not unique_photos:
             browser.close()
             return
 
         # Sort by index to maintain order
-        photos.sort(key=lambda x: x.get("i", 0))
+        unique_photos.sort(key=lambda x: x.get("i", 0))
 
         # ── Step 3: Download images ──────────────────────────────────────────
         print(f"[3/4] Downloading to: {OUTPUT_DIR}")
@@ -95,10 +129,9 @@ def download_album():
         failed = 0
         skipped = 0
 
-        for idx, ph in enumerate(photos, 1):
+        for idx, ph in enumerate(unique_photos, 1):
             img_url = ph.get("ol") or ph.get("bl") or ph.get("sl") or ph.get("url1920")
             if not img_url:
-                print(f"[{idx:>3}/{total}] SKIP: no URL")
                 failed += 1
                 continue
 
@@ -120,14 +153,11 @@ def download_album():
 
             # Handle duplicates
             if filepath.exists():
-                # Check if file size matches (if available)
                 existing_size = filepath.stat().st_size
                 expected_size = ph.get("os", 0)
                 if expected_size and existing_size == expected_size:
-                    print(f"[{idx:>3}/{total}] EXISTS (verified): {base}")
                     skipped += 1
                     continue
-                # Otherwise rename
                 stem = filepath.stem
                 suffix = filepath.suffix
                 counter = 1
@@ -144,19 +174,19 @@ def download_album():
                         body = resp.body()
                         with open(filepath, "wb") as f:
                             f.write(body)
-                        size_mb = len(body) / 1024 / 1024
-                        print(f"[{idx:>3}/{total}] OK {base} ({size_mb:.2f} MB)")
                         success += 1
+                        if idx % 10 == 0 or idx == total:
+                            print(f"[{idx:>4}/{total}] {base} ({len(body)/1024/1024:.2f} MB)")
                         break
                     else:
-                        print(f"[{idx:>3}/{total}] HTTP {resp.status} (attempt {attempt})")
                         if attempt == MAX_RETRIES:
                             failed += 1
+                            print(f"[{idx:>4}/{total}] HTTP {resp.status} - {base}")
                         time.sleep(1)
                 except Exception as e:
-                    print(f"[{idx:>3}/{total}] ERROR (attempt {attempt}): {e}")
                     if attempt == MAX_RETRIES:
                         failed += 1
+                        print(f"[{idx:>4}/{total}] ERROR: {e} - {base}")
                     time.sleep(1)
 
         browser.close()

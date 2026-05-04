@@ -194,18 +194,24 @@ def download_sub_album(context, sub_album):
     page.goto(album_url, wait_until="domcontentloaded", timeout=API_TIMEOUT)
     log("  DOM ready, scrolling...")
 
-    # Wait and scroll to trigger all API calls
+    # Wait and scroll inside container to trigger all API calls
     prev_count = 0
     stall_count = 0
-    for i in range(30):
-        time.sleep(1)
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    for i in range(200):
+        time.sleep(1.5)
+        page.evaluate("""
+            () => {
+                const el = document.querySelector('.component-scroll') || document.querySelector('.album-scrollList');
+                if (el) el.scrollTop = el.scrollHeight;
+            }
+        """)
         if len(fplN_urls) > prev_count:
             prev_count = len(fplN_urls)
             stall_count = 0
         else:
             stall_count += 1
-        if stall_count >= 5 and len(fplN_urls) > 0:
+        if stall_count >= 30 and len(fplN_urls) > 0:
+            log(f"  Stopped: no new pages after {stall_count} scrolls")
             break
 
     time.sleep(1)
